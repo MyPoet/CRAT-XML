@@ -1,0 +1,5 @@
+# Ignore dataet file in this directory
+*
+# Except these file
+!.gitignore
+!.bert-base-uncased-vocab.txt

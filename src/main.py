@@ -6,7 +6,6 @@ import torch
 import numpy as np
 
 
-
 def init_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
