@@ -35,12 +35,10 @@ def createDataCSV(dataset):
             labels.append(i.replace('\n', ''))
 
     with open(f'./data/{dataset}/test_labels.txt') as f:
-        print(len(label_map))
         for i in tqdm.tqdm(f):
             for l in i.replace('\n', '').split():
                 label_map[l] = 0
             labels.append(i.replace('\n', ''))
-        print(len(label_map))
 
     assert len(texts) == len(labels) == len(dataType)
 
