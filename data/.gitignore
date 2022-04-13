@@ -3,3 +3,4 @@
 # Except these file
 !.gitignore
 !.bert-base-uncased-vocab.txt
+!cluster.py
