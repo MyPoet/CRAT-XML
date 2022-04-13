@@ -25,7 +25,7 @@ def get_bert(bert_name):
         bert = BertModel.from_pretrained('bert-base-uncased', config=model_config)
     return bert
 
-class CaRtXML(nn.Module):
+class CRATXML(nn.Module):
     def __init__(self, num_labels, bert='bert-base', dropout=0.5,):
-        super(CaRtXML, self).__init__()
+        super(CRATXML, self).__init__()
 
