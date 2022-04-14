@@ -29,3 +29,4 @@ class CRATXML(nn.Module):
     def __init__(self, num_labels, bert='bert-base', dropout=0.5,):
         super(CRATXML, self).__init__()
 
+        print("CRATXML")

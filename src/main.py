@@ -2,12 +2,13 @@ import sys
 import random
 import datetime
 import argparse
+from model import CRATXML
 
 import torch
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from dataset import createDataCSV
+from dataset import createDataCSV, CRATXML
 from log import Logger
 
 def init_seed(seed):
@@ -67,4 +68,5 @@ if __name__ == '__main__':
                 _group_y[-1].append(label_map[label])
             _group_y[-1] = np.array(_group_y[-1])
         print("The length of label_map: ", len(label_map), "The length of label_map", len(_group_y))
-    
+
+        model = CRATXML()
