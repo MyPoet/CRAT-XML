@@ -61,32 +61,33 @@ def train(model, df, label_map):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)    
     model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
 
+    print("real training...")
     max_only_p5 = 0
     for epoch in range(0, 5): # args.epoch+
         train_loss = model.one_epoch(epoch, trainloader, optimizer, mode='train',
                                         eval_loader=validloader if args.valid else testloader,
                                         eval_step=args.eval_step, log=LOG)
 
-        # if args.valid:
-        #     ev_result = model.one_epoch(epoch, validloader, optimizer, mode='eval')
-        # else:
-        #     ev_result = model.one_epoch(epoch, testloader, optimizer, mode='eval')
+        if args.valid:
+            ev_result = model.one_epoch(epoch, validloader, optimizer, mode='eval')
+        else:
+            ev_result = model.one_epoch(epoch, testloader, optimizer, mode='eval')
 
-        # g_p1, g_p3, g_p5, p1, p3, p5 = ev_result
+        g_p1, g_p3, g_p5, p1, p3, p5 = ev_result
 
-        # log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
-        # if args.dataset in ['wiki500k', 'amazon670k']:
-        #     log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
-        # if args.valid:
-        #     log_str += ' valid'
-        # LOG.log(log_str)
+        log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
+        if args.dataset in ['wiki500k', 'amazon670k']:
+            log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
+        if args.valid:
+            log_str += ' valid'
+        LOG.log(log_str)
 
-        # if max_only_p5 < p5:
-        #     max_only_p5 = p5
-        #     model.save_model(f'models/model-'+str(args.dataset+args.bert)+'.bin')
+        if max_only_p5 < p5:
+            max_only_p5 = p5
+            model.save_model(f'models/model-'+str(args.dataset+args.bert)+'.bin')
 
-        # if epoch >= args.epoch + 5 and max_only_p5 != p5:
-        #     break
+        if epoch >= args.epoch + 5 and max_only_p5 != p5:
+            break
 
 
 
@@ -98,13 +99,14 @@ parser.add_argument('--lr', type=float, required=False, default=0.0001)
 parser.add_argument('--epoch', type=int, required=False, default=20)
 parser.add_argument('--dataset', type=str, required=False, default='eurlex4k')
 parser.add_argument('--max_len', type=int, required=False, default=512)
-parser.add_argument("--n_gpu", type=str, default='5', help='"0,1,.." or "0" or "" ')
+parser.add_argument("--n_gpu", type=str, default='2', help='"0,1,.." or "0" or "" ')
 
 parser.add_argument('--valid', action='store_true')
 parser.add_argument('--bert', type=str, required=False, default='bert-base')
 parser.add_argument('--eval_model', action='store_true')
 parser.add_argument('--eval_step', type=int, required=False, default=20000)
 parser.add_argument('--hidden_dim', type=int, required=False, default=256)
+parser.add_argument('--update_count', type=int, required=False, default=1)
 
 # cluster arguments
 parser.add_argument('--group_y_group', type=int, default=0) # 聚类编号
@@ -145,6 +147,7 @@ if __name__ == '__main__':
         print("The length of label_map: ", len(label_map), "The length of label_map", len(_group_y))
 
         model = CRATXML(num_labels=len(label_map), group_y=group_y, bert=args.bert,
+                            update_count=args.update_count,
                             candidates_topk=args.group_y_candidate_topk,
                             hidden_dim=args.hidden_dim,
                             use_swa=args.swa, swa_warmup_epoch=args.swa_warmup, swa_update_step=args.swa_step)
@@ -155,8 +158,5 @@ if __name__ == '__main__':
     # predict
     if args.eval_model and args.dataset in ['wiki500k', 'amazon670k']:
         print("predict")
-
-
-
 
     train(model, df, label_map)

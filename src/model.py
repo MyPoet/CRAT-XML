@@ -36,7 +36,7 @@ def get_bert(bert_name):
 
 class CRATXML(nn.Module):
     def __init__(self, num_labels, group_y=None, bert='bert-base', feature_layers=5, dropout=0.5, 
-                candidates_topk=10, hidden_dim=300, device_id=0,
+                update_count=1, candidates_topk=10, hidden_dim=300, device_id=0,
                 use_swa=True, swa_warmup_epoch=10, swa_update_step=200):
         super(CRATXML, self).__init__()
         print("CRATXML")
@@ -45,6 +45,7 @@ class CRATXML(nn.Module):
         self.swa_warmup_epoch = swa_warmup_epoch
         self.swa_update_step = swa_update_step
         self.swa_state = {}
+        self.update_count = update_count
 
         self.candidates_topk = candidates_topk
         self.bert_name, self.bert = bert, get_bert(bert)
@@ -102,6 +103,7 @@ class CRATXML(nn.Module):
             if is_training:
                 loss_fn = torch.nn.BCEWithLogitsLoss()
                 loss = loss_fn(logits, labels)
+                print(loss)
                 return logits, loss
             else:
                 return logits
@@ -110,6 +112,8 @@ class CRATXML(nn.Module):
             l = labels.to(self.device_id, dtype=torch.bool)
             target_candidates = torch.masked_select(candidates, l).detach().cpu()
             target_candidates_num = l.sum(dim=1).detach().cpu()
+        print("group_logits", group_logits)
+        print("group_labels", group_labels)
         groups, candidates, group_candidates_scores = self.get_candidates(group_logits,
                                                                           group_gd=group_labels if is_training else None)
         if is_training:
@@ -251,10 +255,80 @@ class CRATXML(nn.Module):
                         inputs['group_labels'] = batch[4].to(self.device_id)
                         inputs['candidates'] = batch[5].to(self.device_id)
 
-                output = self(**inputs)
+                outputs = self(**inputs)
+                bar.update(1)
 
+                if mode == 'train':
+                    loss = outputs[1]
+                    loss /= self.update_count
+                    train_loss += loss.item()
 
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
 
-        return 1.0
+                    if step % self.update_count == 0:
+                        optimizer.step()
+                        self.zero_grad()
+
+                    if step % eval_step == 0 and eval_loader is not None and step != 0:
+                        results = self.one_epoch(epoch, eval_loader, optimizer, mode='eval')
+                        p1, p3, p5 = results[3:6]
+                        g_p1, g_p3, g_p5 = results[:3]
+                        if self.group_y is not None:
+                            log.log(f'{epoch:>2} {step:>6}: {p1:.4f}, {p3:.4f}, {p5:.4f}'
+                                    f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}')
+                        else:
+                            log.log(f'{epoch:>2} {step:>6}: {p1:.4f}, {p3:.4f}, {p5:.4f}')
+
+                    if self.use_swa and step % self.swa_update_step == 0:
+                        self.swa_step()
+                    bar.set_postfix(loss=loss.item())
+                elif self.group_y is None:
+                    logits = outputs
+                    if mode == 'eval':
+                        labels = batch[3]
+                        _total, _acc1, _acc3, _acc5 =  self.get_accuracy(None, logits, labels.cpu().numpy())
+                        total += _total; acc1 += _acc1; acc3 += _acc3; acc5 += _acc5
+                        p1 = acc1 / total
+                        p3 = acc3 / total / 3
+                        p5 = acc5 / total / 5
+                        bar.set_postfix(p1=p1, p3=p3, p5=p5)
+                    elif mode == 'test':
+                        pred_scores.append(logits.detach().cpu())
+                else:
+                    group_logits, candidates, logits = outputs
+
+                    if mode == 'eval':
+                        labels = batch[3]
+                        group_labels = batch[4]
+
+                        _total, _acc1, _acc3, _acc5 = self.get_accuracy(candidates, logits, labels.cpu().numpy())
+                        total += _total; acc1 += _acc1; acc3 += _acc3; acc5 += _acc5
+                        p1 = acc1 / total
+                        p3 = acc3 / total / 3
+                        p5 = acc5 / total / 5
+    
+                        _, _g_acc1, _g_acc3, _g_acc5 = self.get_accuracy(None, group_logits, group_labels.cpu().numpy())
+                        g_acc1 += _g_acc1; g_acc3 += _g_acc3; g_acc5 += _g_acc5
+                        g_p1 = g_acc1 / total
+                        g_p3 = g_acc3 / total / 3
+                        g_p5 = g_acc5 / total / 5
+                        bar.set_postfix(p1=p1, p3=p3, p5=p5, g_p1=g_p1, g_p3=g_p3, g_p5=g_p5)
+                    elif mode == 'test':
+                        _scores, _indices = torch.topk(logits.detach().cpu(), k=100)
+                        _labels = torch.stack([candidates[i][_indices[i]] for i in range(_indices.shape[0])], dim=0)
+                        pred_scores.append(_scores.cpu())
+                        pred_labels.append(_labels.cpu())
+
+        if self.use_swa and mode == 'eval':
+            self.swa_swap_params()
+        bar.close()
+
+        if mode == 'eval':
+            return g_p1, g_p3, g_p5, p1, p3, p5
+        elif mode == 'test':
+            return torch.cat(pred_scores, dim=0).numpy(), torch.cat(pred_labels, dim=0).numpy() if len(pred_labels) != 0 else None
+        elif mode == 'train':
+            return train_loss
 
                 
