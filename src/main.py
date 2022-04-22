@@ -14,6 +14,7 @@ from transformers import AdamW
 from dataset import createDataCSV, CRATDataset
 from log import Logger
 from model import CRATXML
+from gpu import model_device
 
 def init_seed(seed):
     np.random.seed(seed)
@@ -34,23 +35,23 @@ def train(model, df, label_map):
         group_y = load_group(args.dataset, args.group_y_group)
         train_d = CRATDataset(df, 'train', tokenizer, label_map, args.max_len, group_y=group_y,
                                 candidates_num=args.group_y_candidate_num)
-        test_d = CRATDataset(df, 'test', tokenizer, label_map, args.max_len, group_y=group_y,
+        test_d = CRATDataset(df, 'test', tokenizer, label_map, args.max_len, 
                                 candidates_num=args.group_y_candidate_num)
 
         train_d.tokenizer = model.get_fast_tokenizer()
         test_d.tokenizer = model.get_fast_tokenizer()
 
-        trainloader = DataLoader(train_d, batch_size=args.batch, num_workers=5, shuffle=True)
-        testloader = DataLoader(test_d, batch_size=args.batch, num_workers=5, shuffle=False)
+        trainloader = DataLoader(train_d, batch_size=args.batch, num_workers=2, shuffle=True)
+        testloader = DataLoader(test_d, batch_size=args.batch, num_workers=2, shuffle=False)
         if args.valid:
             valid_d = CRATDataset(df, 'valid', tokenizer, label_map, args.max_len, group_y=group_y,
                                 candidates_num=args.group_y_candidate_num)
-            validloader = DataLoader(test_d, batch_size=args.batch, num_workers=5, shuffle=False)
+            validloader = DataLoader(valid_d, batch_size=args.batch, num_workers=2, shuffle=False)
     else:
         train_d = CRATDataset(df, 'train', tokenizer, label_map, args.max_len)
         test_d = CRATDataset(df, 'test', tokenizer, label_map, args.max_len)
         trainloader = DataLoader(train_d, batch_size=args.batch, num_workers=2, shuffle=True)
-        testLoader = DataLoader(test_d, batch_size=args.batch, num_workers=1, shuffle=True)
+        testloader = DataLoader(test_d, batch_size=args.batch, num_workers=2, shuffle=True)
 
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -60,6 +61,35 @@ def train(model, df, label_map):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)    
     model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
 
+    max_only_p5 = 0
+    for epoch in range(0, 5): # args.epoch+
+        train_loss = model.one_epoch(epoch, trainloader, optimizer, mode='train',
+                                        eval_loader=validloader if args.valid else testloader,
+                                        eval_step=args.eval_step, log=LOG)
+
+        # if args.valid:
+        #     ev_result = model.one_epoch(epoch, validloader, optimizer, mode='eval')
+        # else:
+        #     ev_result = model.one_epoch(epoch, testloader, optimizer, mode='eval')
+
+        # g_p1, g_p3, g_p5, p1, p3, p5 = ev_result
+
+        # log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
+        # if args.dataset in ['wiki500k', 'amazon670k']:
+        #     log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
+        # if args.valid:
+        #     log_str += ' valid'
+        # LOG.log(log_str)
+
+        # if max_only_p5 < p5:
+        #     max_only_p5 = p5
+        #     model.save_model(f'models/model-'+str(args.dataset+args.bert)+'.bin')
+
+        # if epoch >= args.epoch + 5 and max_only_p5 != p5:
+        #     break
+
+
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, required=False, default=2022)
@@ -68,11 +98,12 @@ parser.add_argument('--lr', type=float, required=False, default=0.0001)
 parser.add_argument('--epoch', type=int, required=False, default=20)
 parser.add_argument('--dataset', type=str, required=False, default='eurlex4k')
 parser.add_argument('--max_len', type=int, required=False, default=512)
-parser.add_argument("--n_gpu", type=str, default='0', help='"0,1,.." or "0" or "" ')
+parser.add_argument("--n_gpu", type=str, default='5', help='"0,1,.." or "0" or "" ')
 
 parser.add_argument('--valid', action='store_true')
 parser.add_argument('--bert', type=str, required=False, default='bert-base')
 parser.add_argument('--eval_model', action='store_true')
+parser.add_argument('--eval_step', type=int, required=False, default=20000)
 parser.add_argument('--hidden_dim', type=int, required=False, default=256)
 
 # cluster arguments
@@ -80,6 +111,10 @@ parser.add_argument('--group_y_group', type=int, default=0) # 聚类编号
 parser.add_argument('--group_y_candidate_num', type=int, required=False, default=3000)
 parser.add_argument('--group_y_candidate_topk', type=int, required=False, default=10)
 
+# swa
+parser.add_argument('--swa', action='store_true')
+parser.add_argument('--swa_warmup', type=int, required=False, default=10)
+parser.add_argument('--swa_step', type=int, required=False, default=100)
 
 args = parser.parse_args()
 
@@ -111,11 +146,15 @@ if __name__ == '__main__':
 
         model = CRATXML(num_labels=len(label_map), group_y=group_y, bert=args.bert,
                             candidates_topk=args.group_y_candidate_topk,
-                            hidden_dim=args.hidden_dim)
+                            hidden_dim=args.hidden_dim,
+                            use_swa=args.swa, swa_warmup_epoch=args.swa_warmup, swa_update_step=args.swa_step)
 
-        # predict
-        if args.eval_model and args.dataset in ['wiki500k', 'amazon670k']:
-            print("predict")
+    model, device_id = model_device(n_gpu = args.n_gpu, model=model)
+    model.device_id = device_id
+
+    # predict
+    if args.eval_model and args.dataset in ['wiki500k', 'amazon670k']:
+        print("predict")
 
 
 

@@ -1,9 +1,13 @@
 import time
 from tokenize import group
+from turtle import forward
+
+from importlib_metadata import requires
 
 import tqdm
 import numpy as np
 from apex import amp
+import torch
 from torch import nn
 from transformers import BertTokenizer, BertConfig, BertModel
 from transformers import RobertaModel, RobertaConfig, RobertaTokenizer
@@ -31,12 +35,20 @@ def get_bert(bert_name):
     return bert
 
 class CRATXML(nn.Module):
-    def __init__(self, num_labels, group_y=None, bert='bert-base', dropout=0.5, candidates_topk=10, hidden_dim=300, device_id=0):
+    def __init__(self, num_labels, group_y=None, bert='bert-base', feature_layers=5, dropout=0.5, 
+                candidates_topk=10, hidden_dim=300, device_id=0,
+                use_swa=True, swa_warmup_epoch=10, swa_update_step=200):
         super(CRATXML, self).__init__()
         print("CRATXML")
 
+        self.use_swa = use_swa
+        self.swa_warmup_epoch = swa_warmup_epoch
+        self.swa_update_step = swa_update_step
+        self.swa_state = {}
+
         self.candidates_topk = candidates_topk
         self.bert_name, self.bert = bert, get_bert(bert)
+        self.feature_layers = feature_layers
         self.drop_out = nn.Dropout(dropout)
 
         self.group_y = group_y
@@ -45,14 +57,117 @@ class CRATXML(nn.Module):
             print('hidden dim:',  hidden_dim)
             print('label group numbers:',  self.group_y_labels)
 
-            self.l0 = nn.Linear(self.bert.config.hidden_size, self.group_y_labels)
+            self.l0 = nn.Linear(self.feature_layers*self.bert.config.hidden_size, self.group_y_labels)
             # hidden bottle layer
-            self.l1 = nn.Linear(self.bert.config.hidden_size, hidden_dim)
+            self.l1 = nn.Linear(self.feature_layers*self.bert.config.hidden_size, hidden_dim)
             self.embed = nn.Embedding(num_labels, hidden_dim)
             nn.init.xavier_uniform_(self.embed.weight)
         else:
-            self.l0 = nn.Linear(self.bert.config.hidden_size, num_labels)
+            self.l0 = nn.Linear(self.feature_layers*self.bert.config.hidden_size, num_labels)
         self.device_id = device_id
+
+    def get_candidates(self, group_logits, group_gd=None):
+        logits = torch.sigmoid(group_logits.detach())
+        if group_gd is not None:
+            logits += group_gd
+        scores, indices = torch.topk(logits, k=self.candidates_topk)
+        scores, indices = scores.cpu().detach().numpy(), indices.cpu().detach().numpy()
+        candidates, candidates_scores = [], []
+        for index, score in zip(indices, scores):
+            candidates.append(self.group_y[index])
+            candidates_scores.append([np.full(c.shape, s) for c, s in zip(candidates[-1], score)])
+            candidates[-1] = np.concatenate(candidates[-1])
+            candidates_scores[-1] = np.concatenate(candidates_scores[-1])
+        max_candidates = max([i.shape[0] for i in candidates])
+        candidates = np.stack([np.pad(i, (0, max_candidates - i.shape[0]), mode='edge') for i in candidates])
+        candidates_scores = np.stack([np.pad(i, (0, max_candidates - i.shape[0]), mode='edge') for i in candidates_scores])
+        return indices, candidates, candidates_scores
+
+
+    def forward(self, input_ids, attention_mask, token_type_ids, 
+                labels=None, group_labels=None, candidates=None):
+        is_training = labels is not None
+
+        outs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )[-1]
+
+        out = torch.cat([outs[-i][:, 0] for i in range(1, self.feature_layers+1)], dim=-1)
+        out = self.drop_out(out)
+        group_logits = self.l0(out)
+        if self.group_y is None:
+            logits = group_logits
+            if is_training:
+                loss_fn = torch.nn.BCEWithLogitsLoss()
+                loss = loss_fn(logits, labels)
+                return logits, loss
+            else:
+                return logits
+
+        if is_training:
+            l = labels.to(self.device_id, dtype=torch.bool)
+            target_candidates = torch.masked_select(candidates, l).detach().cpu()
+            target_candidates_num = l.sum(dim=1).detach().cpu()
+        groups, candidates, group_candidates_scores = self.get_candidates(group_logits,
+                                                                          group_gd=group_labels if is_training else None)
+        if is_training:
+            bs = 0
+            new_labels = []
+            for i, n in enumerate(target_candidates_num.numpy()):
+                be = bs + n
+                c = set(target_candidates[bs: be].numpy())
+                c2 = candidates[i]
+                new_labels.append(torch.tensor([1.0 if i in c else 0.0 for i in c2 ]))
+                if len(c) != new_labels[-1].sum():
+                    s_c2 = set(c2)
+                    for cc in list(c):
+                        if cc in s_c2:
+                            continue
+                        for j in range(new_labels[-1].shape[0]):
+                            if new_labels[-1][j].item() != 1:
+                                c2[j] = cc
+                                new_labels[-1][j] = 1.0
+                                break
+                bs = be
+            labels = torch.stack(new_labels).to(self.device_id)
+        candidates, group_candidates_scores =  torch.LongTensor(candidates).to(self.device_id), torch.Tensor(group_candidates_scores).to(self.device_id)
+
+        emb = self.l1(out)
+        embed_weights = self.embed(candidates) # N, sampled_size, H
+        emb = emb.unsqueeze(-1)
+        logits = torch.bmm(embed_weights, emb).squeeze(-1)
+
+        if is_training:
+            loss_fn = torch.nn.BCEWithLogitsLoss()
+            loss = loss_fn(logits, labels) + loss_fn(group_logits, group_labels)
+            return logits, loss
+        else:
+            candidates_scores = torch.sigmoid(logits)
+            candidates_scores = candidates_scores * group_candidates_scores
+            return group_logits, candidates, candidates_scores
+
+    def swa_init(self):
+        self.swa_state = {'models_num': 1}
+        for n, p in self.named_parameters():
+            self.swa_state[n] = p.data.cpu().clone().detach()
+
+    def swa_step(self):
+        if 'models_num' not in self.swa_state:
+            return
+        self.swa_state['models_num'] += 1
+        beta = 1.0 / self.swa_state['models_num']
+        with torch.no_grad():
+            for n, p in self.named_parameters():
+                self.swa_state[n].mul_(1.0 - beta).add_(beta, p.data.cpu())
+
+    def swa_swap_params(self):
+        if 'models_num' not in self.swa_state:
+            return
+        for n, p in self.named_parameters():
+            self.swa_state[n], p.data =  self.swa_state[n].cpu(), p.data.cpu()
+            self.swa_state[n], p.data =  p.data.cpu(), self.swa_state[n].to(self.device_id)
 
     def get_fast_tokenizer(self):
         if 'roberta' in self.bert_name:
@@ -77,11 +192,32 @@ class CRATXML(nn.Module):
             tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
         return tokenizer
 
+    def get_accuracy(self, candidates, logits, labels):
+        if candidates is not None:
+            candidates = candidates.detach().cpu()
+        scores, indices = torch.topk(logits.detach().cpu(), k=10)
+
+        acc1, acc3, acc5, total = 0, 0, 0, 0
+        for i, l in enumerate(labels):
+            l = set(np.nonzero(l)[0])
+
+            if candidates is not None:
+                labels = candidates[i][indices[i]].numpy()
+            else:
+                labels = indices[i, :5].numpy()
+
+            acc1 += len(set([labels[0]]) & l)
+            acc3 += len(set(labels[:3]) & l)
+            acc5 += len(set(labels[:5]) & l)
+            total += 1
+
+        return total, acc1, acc3, acc5
 
     # train_loss_1 表示本体句子的loss
     # train_loss_2 表示对抗句子的loss
     # cl_loss 表示对比训练的loss
-    def one_epoch(self, epoch, dataloader, optimizer, mode='train', eval_loader=None, eval_step=20000, log=None):
+    def one_epoch(self, epoch, dataloader, optimizer, mode='train', 
+                    eval_loader=None, eval_step=20000, log=None):
         bar = tqdm.tqdm(total=len(dataloader))
         p1, p3, p5 = 0, 0, 0
         g_p1, g_p3, g_p5 = 0, 0, 0
@@ -94,19 +230,31 @@ class CRATXML(nn.Module):
         else:
             self.eval()
         
+        if self.use_swa and epoch == self.swa_warmup_epoch and mode == 'train':
+            self.swa_init()
+
+        if self.use_swa and mode == 'eval':
+            self.swa_swap_params()
+
         pred_scores, pred_labels = [], []
         bar.set_description(f'{mode}-{epoch}')
 
         with torch.set_grad_enabled(mode == 'train'):
             for step, data in enumerate(dataloader):
-                batch = tuple(t for i in data)
-                inputs = {'input_ids': batch[0].to(self.device_id),
-                            'attention_mask': batch[1].to(self.device_id),
-                            'token_type_ids': batch[2].to(self.device_id)}
+                batch = tuple(t for t in data)
+                inputs = {'input_ids':      batch[0].to(self.device_id),
+                          'attention_mask': batch[1].to(self.device_id),
+                          'token_type_ids': batch[2].to(self.device_id)}
                 if mode == 'train':
                     inputs['labels'] = batch[3].to(self.device_id)
                     if self.group_y is not None:
                         inputs['group_labels'] = batch[4].to(self.device_id)
                         inputs['candidates'] = batch[5].to(self.device_id)
+
+                output = self(**inputs)
+
+
+
+        return 1.0
 
                 

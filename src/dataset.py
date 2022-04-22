@@ -66,8 +66,10 @@ class CRATDataset(Dataset):
         self.token_type_ids = token_type_ids
         self.candidates_num = candidates_num
 
+        self.multi_group = False # ???
+
         if group_y is not None:
-            self.candidates_num, self.group_y, self.n_group_y_labels = candidates_num, [], group_y.shape[0]
+            self.candidates_num, self.group_y, self.num_group_y_labels = candidates_num, [], group_y.shape[0]
             self.map_group_y = np.empty(len(label_map), dtype=np.long)
             for idx, labels in enumerate(group_y):
                 self.group_y.append([])
@@ -76,6 +78,81 @@ class CRATDataset(Dataset):
                 self.map_group_y[self.group_y[-1]] = idx
                 self.group_y[-1]  = np.array(self.group_y[-1])
             self.group_y = np.array(self.group_y)
+
+    def __getitem__(self, idx):
+        max_len = self.max_length
+        review = self.df.text.values[idx].lower()
+        labels = [self.label_map[i] for i in self.df.label.values[idx].split() if i in self.label_map]
+
+        review = ' '.join(review.split()[:max_len])
+
+        text = review
+        if self.token_type_ids is not None:
+            input_ids = self.token_type_ids[idx]
+            if input_ids[-1] == 0:
+                input_ids = input_ids[input_ids != 0]
+            input_ids = input_ids.tolist()
+        elif hasattr(self.tokenizer, 'encode_plus'):
+            input_ids = self.tokenizer.encode(
+                'filling empty' if len(text) == 0 else text,
+                add_special_tokens=True,
+                max_length=max_len
+            )
+        else:
+            # fast 
+            input_ids = self.tokenizer.encode(
+                'filling empty' if len(text) == 0 else text,
+                add_special_tokens=True
+            ).ids
+
+        if len(input_ids) == 0:
+            print('zero string')
+            assert 0
+        if len(input_ids) > self.max_length:
+            input_ids[self.max_length-1] = input_ids[-1]
+            input_ids = input_ids[:self.max_length]
+
+        attention_mask = [1] * len(input_ids)
+        token_type_ids = [0] * len(input_ids)
+
+        padding_length = self.max_length - len(input_ids)
+        input_ids = input_ids + ([0] * padding_length)
+        attention_mask = attention_mask + ([0] * padding_length)
+        token_type_ids = token_type_ids + ([0] * padding_length)
+
+        input_ids = torch.tensor(input_ids)
+        attention_mask = torch.tensor(attention_mask)
+        token_type_ids = torch.tensor(token_type_ids)
+
+        if self.group_y is not None:
+            label_ids = torch.zeros(self.num_labels)
+            label_ids = label_ids.scatter(0, torch.tensor(labels),
+                                        torch.tensor([1.0 for i in labels]))
+            group_labels = self.map_group_y[labels]
+            if self.multi_group:
+                group_labels = np.concatenate(group_labels)
+            group_label_ids = torch.zeros(self.num_group_y_labels)
+            group_label_ids = group_label_ids.scatter(0, torch.tensor(group_labels),
+                                    torch.tensor([1.0 for i in group_labels]))
+            candidates = np.concatenate(self.group_y[group_labels], axis=0)
+
+            if len(candidates) < self.candidates_num:
+                sample = np.random.randint(self.num_group_y_labels, size=self.candidates_num - len(candidates))
+                candidates = np.concatenate([candidates, sample])
+            elif len(candidates) > self.candidates_num:
+                candidates = np.random.choice(candidates, self.candidates_num, replace=False)
+
+            if self.mode == 'train':
+                return input_ids, attention_mask, token_type_ids,\
+                    label_ids[candidates], group_label_ids, candidates
+            else:
+                return input_ids, attention_mask, token_type_ids,\
+                    label_ids, group_label_ids, candidates
+
+        label_ids = torch.zeros(self.num_labels)
+        label_ids = label_ids.scatter(0, torch.tensor(labels),
+                                    torch.tensor([1.0 for i in labels]))
+        return input_ids, attention_mask, token_type_ids, label_ids
 
     def __len__(self):
         return self.len 
