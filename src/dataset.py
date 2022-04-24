@@ -33,13 +33,13 @@ def createDataCSV(dataset):
     with open(f'./data/{dataset}/train_labels.txt') as f:
         for i in tqdm.tqdm(f):
             for l in i.replace('\n', '').split():
-                label_map[l] = 0
+                label_map[int(l)] = 0
             labels.append(i.replace('\n', ''))
 
     with open(f'./data/{dataset}/test_labels.txt') as f:
         for i in tqdm.tqdm(f):
             for l in i.replace('\n', '').split():
-                label_map[l] = 0
+                label_map[int(l)] = 0
             labels.append(i.replace('\n', ''))
 
     assert len(texts) == len(labels) == len(dataType)
@@ -82,7 +82,7 @@ class CRATDataset(Dataset):
     def __getitem__(self, idx):
         max_len = self.max_length
         review = self.df.text.values[idx].lower()
-        labels = [self.label_map[i] for i in self.df.label.values[idx].split() if i in self.label_map]
+        labels = [self.label_map[int(i)] for i in self.df.label.values[idx].split() if int(i) in self.label_map]
 
         review = ' '.join(review.split()[:max_len])
 

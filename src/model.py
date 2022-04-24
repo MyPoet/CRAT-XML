@@ -39,7 +39,6 @@ class CRATXML(nn.Module):
                 update_count=1, candidates_topk=10, hidden_dim=300, device_id=0,
                 use_swa=True, swa_warmup_epoch=10, swa_update_step=200):
         super(CRATXML, self).__init__()
-        print("CRATXML")
 
         self.use_swa = use_swa
         self.swa_warmup_epoch = swa_warmup_epoch
@@ -48,7 +47,7 @@ class CRATXML(nn.Module):
         self.update_count = update_count
 
         self.candidates_topk = candidates_topk
-        self.bert_name, self.bert = bert, get_bert(bert)
+        self.bert_name, self.bert = bert, get_bert(bert).to(device_id)
         self.feature_layers = feature_layers
         self.drop_out = nn.Dropout(dropout)
 
@@ -76,14 +75,13 @@ class CRATXML(nn.Module):
         candidates, candidates_scores = [], []
         for index, score in zip(indices, scores):
             candidates.append(self.group_y[index])
-            candidates_scores.append([np.full(c.shape, s) for c, s in zip(candidates[-1], score)])
+            candidates_scores.append([np.full(np.array(c).shape, s) for c, s in zip(candidates[-1], score)])
             candidates[-1] = np.concatenate(candidates[-1])
             candidates_scores[-1] = np.concatenate(candidates_scores[-1])
         max_candidates = max([i.shape[0] for i in candidates])
         candidates = np.stack([np.pad(i, (0, max_candidates - i.shape[0]), mode='edge') for i in candidates])
         candidates_scores = np.stack([np.pad(i, (0, max_candidates - i.shape[0]), mode='edge') for i in candidates_scores])
         return indices, candidates, candidates_scores
-
 
     def forward(self, input_ids, attention_mask, token_type_ids, 
                 labels=None, group_labels=None, candidates=None):
@@ -112,8 +110,6 @@ class CRATXML(nn.Module):
             l = labels.to(self.device_id, dtype=torch.bool)
             target_candidates = torch.masked_select(candidates, l).detach().cpu()
             target_candidates_num = l.sum(dim=1).detach().cpu()
-        print("group_logits", group_logits)
-        print("group_labels", group_labels)
         groups, candidates, group_candidates_scores = self.get_candidates(group_logits,
                                                                           group_gd=group_labels if is_training else None)
         if is_training:
@@ -228,6 +224,7 @@ class CRATXML(nn.Module):
         total, acc1, acc3, acc5 = 0, 0, 0, 0
         g_acc1, g_acc3, g_acc5 = 0, 0, 0
         train_loss_1, train_loss_2, cl_loss = 0, 0, 0
+        train_loss = 0
 
         if mode == 'train':
             self.train()
@@ -245,7 +242,7 @@ class CRATXML(nn.Module):
 
         with torch.set_grad_enabled(mode == 'train'):
             for step, data in enumerate(dataloader):
-                batch = tuple(t for t in data)
+                batch = tuple(t.to(self.device_id) for t in data)
                 inputs = {'input_ids':      batch[0].to(self.device_id),
                           'attention_mask': batch[1].to(self.device_id),
                           'token_type_ids': batch[2].to(self.device_id)}
@@ -254,7 +251,7 @@ class CRATXML(nn.Module):
                     if self.group_y is not None:
                         inputs['group_labels'] = batch[4].to(self.device_id)
                         inputs['candidates'] = batch[5].to(self.device_id)
-
+                
                 outputs = self(**inputs)
                 bar.update(1)
 

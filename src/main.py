@@ -33,6 +33,8 @@ def train(model, df, label_map):
 
     if args.dataset in ['wiki500k', 'amazon670k']:
         group_y = load_group(args.dataset, args.group_y_group)
+        group_y = [list(map(int, i)) for i in group_y]
+        group_y = np.array(group_y)
         train_d = CRATDataset(df, 'train', tokenizer, label_map, args.max_len, group_y=group_y,
                                 candidates_num=args.group_y_candidate_num)
         test_d = CRATDataset(df, 'test', tokenizer, label_map, args.max_len, 
@@ -59,7 +61,7 @@ def train(model, df, label_map):
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]    
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)    
-    model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+    model, optimizer = amp.initialize(model, optimizer, opt_level="O1")    
 
     print("real training...")
     max_only_p5 = 0
@@ -90,16 +92,14 @@ def train(model, df, label_map):
             break
 
 
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, required=False, default=2022)
 parser.add_argument('--batch', type=int, required=False, default=16)
 parser.add_argument('--lr', type=float, required=False, default=0.0001)
 parser.add_argument('--epoch', type=int, required=False, default=20)
 parser.add_argument('--dataset', type=str, required=False, default='eurlex4k')
-parser.add_argument('--max_len', type=int, required=False, default=512)
-parser.add_argument("--n_gpu", type=str, default='2', help='"0,1,.." or "0" or "" ')
+parser.add_argument('--max_len', type=int, required=False, default=128)
+parser.add_argument("--n_gpu", type=str, default='0', help='"0,1,.." or "0" or "" ')
 
 parser.add_argument('--valid', action='store_true')
 parser.add_argument('--bert', type=str, required=False, default='bert-base')
@@ -138,13 +138,14 @@ if __name__ == '__main__':
 
     if args.dataset in ['wiki500k', 'amazon670k']:
         group_y = load_group(args.dataset, args.group_y_group)
+        group_y = [list(map(int, i)) for i in group_y]
+        group_y = np.array(group_y)
         _group_y = []
         for idx, labels in enumerate(group_y):
             _group_y.append([])
             for label in labels:
                 _group_y[-1].append(label_map[label])
             _group_y[-1] = np.array(_group_y[-1])
-        print("The length of label_map: ", len(label_map), "The length of label_map", len(_group_y))
 
         model = CRATXML(num_labels=len(label_map), group_y=group_y, bert=args.bert,
                             update_count=args.update_count,
